@@ -1,0 +1,83 @@
+name: Signature feed
+
+# Builds, checks and signs one bolt-defend signature release a day and
+# publishes it as a GitHub Release. Servers read the newest one from
+#   https://github.com/AdminBolt/bolt-defend-signatures/releases/latest/download
+#
+# Secrets:
+#   BOLT_DEFEND_SEED        signing seed (bolt-defend-sigtool keygen)
+#   BOLT_DEFEND_DEPLOY_KEY  read-only deploy key of AdminBolt/bolt-defend
+#   MB_API_KEY              MalwareBazaar Auth-Key (optional)
+# Variables:
+#   BOLT_DEFEND_REF         bolt-defend branch to build from (default main)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feed
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out bolt-defend
+        uses: actions/checkout@v4
+        with:
+          repository: AdminBolt/bolt-defend
+          ref: ${{ vars.BOLT_DEFEND_REF || 'main' }}
+          ssh-key: ${{ secrets.BOLT_DEFEND_DEPLOY_KEY }}
+          path: bolt-defend
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Build bolt-defend-sigtool
+        run: cd bolt-defend/app && go build -o "$RUNNER_TEMP/bolt-defend-sigtool" ./cmd/bolt-defend-sigtool
+
+      - name: Build the release
+        env:
+          BOLT_DEFEND_SEED: ${{ secrets.BOLT_DEFEND_SEED }}
+          MB_API_KEY: ${{ secrets.MB_API_KEY }}
+        run: |
+          test -n "$BOLT_DEFEND_SEED" || { echo "BOLT_DEFEND_SEED is not set"; exit 1; }
+          SIGTOOL="$RUNNER_TEMP/bolt-defend-sigtool" OUT="$RUNNER_TEMP/release" bash bolt-defend/feed/build-feed.sh
+
+      # The key servers trust is feed.pub in this repo (the same file the
+      # bolt-defend RPM ships). Never publish a release it does not verify.
+      - name: Verify the signature with minisign
+        run: |
+          sudo apt-get install -y -qq minisign >/dev/null
+          minisign -Vm "$RUNNER_TEMP/release/manifest.json" -x "$RUNNER_TEMP/release/manifest.json.minisig" -p feed.pub
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$RUNNER_TEMP/release/manifest.json")
+          n=$(grep -vc '^#' "$RUNNER_TEMP/release/hashes.tsv")
+          gh release create "sig-$v" "$RUNNER_TEMP"/release/* --repo "$GITHUB_REPOSITORY" --latest \
+            --title "Signatures v$v" --notes "Automatic release: $n hash signatures. Verify with: minisign -Vm manifest.json -x manifest.json.minisig -p feed.pub"
+
+      # Servers only ever read the latest release; keep a month for history.
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,createdAt \
+            -q 'sort_by(.createdAt) | reverse | .[30:] | .[].tagName' \
+            | while read -r tag; do gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag; done
